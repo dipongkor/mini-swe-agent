@@ -34,6 +34,7 @@ agent:
     3. Edit the source code to resolve the issue
     4. Verify your fix works by running your script again
     5. Test edge cases to ensure your fix is robust
+    6. Localize the root cause of the bug (see "Bug Localization" below)
 
     ## Command Execution Rules
 
@@ -72,10 +73,46 @@ agent:
     - You can also create new tools or scripts to help you with the task
     - If a tool isn't available, you can also install it
 
+    ## Bug Localization
+
+    In addition to the patch, you MUST provide a machine-readable bug
+    localization record describing the root cause of the issue. This is a
+    REQUIRED part of every submission — a submission without a valid
+    localization record will be rejected.
+
+    Write a file named `localization.json` in the working directory with
+    EXACTLY this JSON schema:
+
+    ```json
+    {
+      "root_cause": [
+        {
+          "file": "path/to/source_file.py",
+          "line": 143,
+          "statement": "the exact source line responsible for the bug"
+        }
+      ],
+      "reasoning": "A concise explanation of why these lines are the root cause.",
+      "confidence": "high"
+    }
+    ```
+
+    Requirements:
+
+    - `root_cause` is a non-empty list; each entry identifies ONE specific
+      statement in a non-test source file, with its 1-indexed line number.
+    - `file` paths must be relative to the repository root (match the paths
+      used in `git diff`).
+    - `statement` must be the verbatim source line at that location.
+    - `reasoning` is a short free-text explanation (one or two sentences).
+    - `confidence` must be exactly one of `"high"`, `"medium"`, or `"low"`.
+    - The file must be valid JSON. Do not wrap it in markdown fences.
+
     ## Submission
 
-    When you've completed your work, you MUST submit your changes as a git patch.
-    Follow these steps IN ORDER, with SEPARATE commands:
+    When you've completed your work, you MUST submit your changes as a git
+    patch together with the localization record. Follow these steps IN ORDER,
+    with SEPARATE commands:
 
     Step 1: Create the patch file
     Run `git diff -- path/to/file1 path/to/file2 > patch.txt` listing only the source files you modified.
@@ -91,21 +128,29 @@ agent:
     - binary or compiled files
     </IMPORTANT>
 
-    Step 2: Verify your patch
-    Inspect patch.txt to confirm it only contains your intended changes and headers show `--- a/` and `+++ b/` paths.
+    Step 2: Write localization.json
+    Create `localization.json` in the working directory following the schema
+    documented under "Bug Localization" above. The files referenced in
+    `root_cause` should correspond to the files modified by your patch.
 
-    Step 3: Submit (EXACT command required)
+    Step 3: Verify your patch and localization
+    Inspect `patch.txt` to confirm it only contains your intended changes and
+    headers show `--- a/` and `+++ b/` paths. Inspect `localization.json` to
+    confirm it is valid JSON and matches the required schema.
+
+    Step 4: Submit (EXACT command required)
     You MUST use this EXACT command to submit:
 
     ```bash
-    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat localization.json && echo '<<<MSWEA_PATCH_DELIMITER>>>' && cat patch.txt
     ```
 
     If the command fails (nonzero exit status), it will not submit.
 
     <CRITICAL>
-    - Creating/viewing the patch and submitting it MUST be separate commands (not combined with &&).
-    - If you modify patch.txt after verifying, you SHOULD verify again before submitting.
+    - Creating/viewing the patch and localization and submitting them MUST be separate commands (not combined with &&).
+    - If you modify `patch.txt` or `localization.json` after verifying, you SHOULD verify again before submitting.
+    - The delimiter `<<<MSWEA_PATCH_DELIMITER>>>` must appear exactly once between the localization JSON and the patch.
     - You CANNOT continue working (reading, editing, testing) in any way on this task after submitting.
     </CRITICAL>
     </instructions>
