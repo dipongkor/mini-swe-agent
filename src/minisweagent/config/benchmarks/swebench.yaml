@@ -115,6 +115,7 @@ agent:
 environment:
   cwd: "/testbed"
   timeout: 60
+  pull_timeout: 1800
   interpreter: ["bash", "-c"]
   env:
     PAGER: cat
