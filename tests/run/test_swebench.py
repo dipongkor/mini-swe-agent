@@ -14,6 +14,7 @@ from minisweagent.run.benchmarks.swebench import (
     remove_from_preds_file,
     update_preds_file,
 )
+from minisweagent.run.benchmarks.utils.localization import Localization
 
 
 def _make_model_from_fixture(text_outputs: list[str], cost_per_call: float = 1.0, **kwargs) -> DeterministicModel:
@@ -56,24 +57,37 @@ def test_swebench_end_to_end(github_test_data, tmp_path, workers, container_exec
     trajectory = json.loads(traj_file_path.read_text())
 
     last_message = trajectory[-1]["content"]
+    # The final submission contains localization JSON + delimiter + patch.
+    _, _, expected_patch = last_message.partition("<<<MSWEA_PATCH_DELIMITER>>>")
+    expected_patch = expected_patch.lstrip("\n")
 
     instance_id = "swe-agent__test-repo-1"
-    expected_result = {
-        instance_id: {
-            "model_name_or_path": "deterministic",
-            "instance_id": instance_id,
-            "model_patch": last_message,
-        }
-    }
 
     with open(tmp_path / "preds.json") as f:
         actual_result = json.load(f)
 
-    assert actual_result == expected_result
+    entry = actual_result[instance_id]
+    assert entry["model_name_or_path"] == "deterministic"
+    assert entry["instance_id"] == instance_id
+    assert entry["model_patch"] == expected_patch
+    assert entry["localization_parse_error"] is None
+    assert entry["localization"] == {
+        "root_cause": [
+            {
+                "file": "tests/missing_colon.py",
+                "line": 4,
+                "statement": "def division(a: float, b: float) -> float",
+            }
+        ],
+        "reasoning": "The function definition on line 4 is missing a trailing colon, causing a SyntaxError.",
+        "confidence": "high",
+    }
 
     traj_output_file = tmp_path / instance_id / f"{instance_id}.traj.json"
     output_trajectory = json.loads(traj_output_file.read_text())
     assert output_trajectory["messages"][-1]["content"] == last_message
+    assert output_trajectory["info"]["localization"] == entry["localization"]
+    assert output_trajectory["info"]["submission"] == expected_patch
 
 
 def test_get_image_name_with_existing_image_name():
@@ -186,6 +200,16 @@ def test_filter_instances_no_matches():
     assert result == []
 
 
+def _empty_loc_entry(instance_id: str, model_name: str, patch: str) -> dict:
+    return {
+        "model_name_or_path": model_name,
+        "instance_id": instance_id,
+        "model_patch": patch,
+        "localization": None,
+        "localization_parse_error": None,
+    }
+
+
 def test_update_preds_file_new_file(tmp_path):
     """Test update_preds_file when output file doesn't exist"""
     output_path = tmp_path / "preds.json"
@@ -193,14 +217,53 @@ def test_update_preds_file_new_file(tmp_path):
 
     assert output_path.exists()
     result = json.loads(output_path.read_text())
-    expected = {
-        "test__instance__1": {
-            "model_name_or_path": "test_model",
-            "instance_id": "test__instance__1",
-            "model_patch": "test_result",
-        }
-    }
+    expected = {"test__instance__1": _empty_loc_entry("test__instance__1", "test_model", "test_result")}
     assert result == expected
+
+
+def test_update_preds_file_with_localization(tmp_path):
+    """Test update_preds_file records localization data in preds.json"""
+    output_path = tmp_path / "preds.json"
+    localization = Localization(
+        root_cause=[{"file": "foo.py", "line": 10, "statement": "x = 1"}],
+        reasoning="x is wrong",
+        confidence="high",
+    )
+    update_preds_file(
+        output_path,
+        "test__instance__1",
+        "test_model",
+        "test_result",
+        localization=localization,
+    )
+
+    result = json.loads(output_path.read_text())
+    entry = result["test__instance__1"]
+    assert entry["model_patch"] == "test_result"
+    assert entry["localization"] == {
+        "root_cause": [{"file": "foo.py", "line": 10, "statement": "x = 1"}],
+        "reasoning": "x is wrong",
+        "confidence": "high",
+    }
+    assert entry["localization_parse_error"] is None
+
+
+def test_update_preds_file_with_parse_error(tmp_path):
+    """Test update_preds_file records localization_parse_error when parsing fails"""
+    output_path = tmp_path / "preds.json"
+    update_preds_file(
+        output_path,
+        "test__instance__1",
+        "test_model",
+        "raw_submission",
+        localization=None,
+        localization_parse_error="Missing delimiter",
+    )
+
+    result = json.loads(output_path.read_text())
+    entry = result["test__instance__1"]
+    assert entry["localization"] is None
+    assert entry["localization_parse_error"] == "Missing delimiter"
 
 
 def test_update_preds_file_existing_file(tmp_path):
@@ -209,11 +272,7 @@ def test_update_preds_file_existing_file(tmp_path):
 
     # Create initial file with one instance
     initial_data = {
-        "existing__instance": {
-            "model_name_or_path": "old_model",
-            "instance_id": "existing__instance",
-            "model_patch": "old_result",
-        }
+        "existing__instance": _empty_loc_entry("existing__instance", "old_model", "old_result"),
     }
     output_path.write_text(json.dumps(initial_data))
 
@@ -222,16 +281,8 @@ def test_update_preds_file_existing_file(tmp_path):
 
     result = json.loads(output_path.read_text())
     expected = {
-        "existing__instance": {
-            "model_name_or_path": "old_model",
-            "instance_id": "existing__instance",
-            "model_patch": "old_result",
-        },
-        "new__instance": {
-            "model_name_or_path": "new_model",
-            "instance_id": "new__instance",
-            "model_patch": "new_result",
-        },
+        "existing__instance": _empty_loc_entry("existing__instance", "old_model", "old_result"),
+        "new__instance": _empty_loc_entry("new__instance", "new_model", "new_result"),
     }
     assert result == expected
 
@@ -241,26 +292,14 @@ def test_update_preds_file_overwrite_existing(tmp_path):
     output_path = tmp_path / "preds.json"
 
     # Create initial file
-    initial_data = {
-        "test__instance": {
-            "model_name_or_path": "old_model",
-            "instance_id": "test__instance",
-            "model_patch": "old_result",
-        }
-    }
+    initial_data = {"test__instance": _empty_loc_entry("test__instance", "old_model", "old_result")}
     output_path.write_text(json.dumps(initial_data))
 
     # Update existing instance
     update_preds_file(output_path, "test__instance", "new_model", "new_result")
 
     result = json.loads(output_path.read_text())
-    expected = {
-        "test__instance": {
-            "model_name_or_path": "new_model",
-            "instance_id": "test__instance",
-            "model_patch": "new_result",
-        }
-    }
+    expected = {"test__instance": _empty_loc_entry("test__instance", "new_model", "new_result")}
     assert result == expected
 
 
@@ -378,11 +417,13 @@ def test_redo_existing_true_overwrites_existing(github_test_data, tmp_path, cont
     # Should have new result from deterministic model
     traj_file_path = package_dir.parent.parent / "tests" / "test_data" / "github_issue.traj.json"
     trajectory = json.loads(traj_file_path.read_text())
-    expected_result = trajectory[-1]["content"]
+    _, _, expected_patch = trajectory[-1]["content"].partition("<<<MSWEA_PATCH_DELIMITER>>>")
+    expected_patch = expected_patch.lstrip("\n")
 
     result = json.loads(preds_file.read_text())
-    assert result["swe-agent__test-repo-1"]["model_patch"] == expected_result
+    assert result["swe-agent__test-repo-1"]["model_patch"] == expected_patch
     assert result["swe-agent__test-repo-1"]["model_name_or_path"] == "deterministic"
+    assert result["swe-agent__test-repo-1"]["localization"] is not None
 
 
 class ExceptionModelConfig(BaseModel):

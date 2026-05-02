@@ -22,6 +22,7 @@ from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
 from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
+from minisweagent.run.benchmarks.utils.localization import Localization, SubmissionParseError, split_submission
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
 
@@ -108,7 +109,14 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
     return env
 
 
-def update_preds_file(output_path: Path, instance_id: str, model_name: str, result: str):
+def update_preds_file(
+    output_path: Path,
+    instance_id: str,
+    model_name: str,
+    result: str,
+    localization: Localization | None = None,
+    localization_parse_error: str | None = None,
+):
     """Update the output JSON file with results from a single instance."""
     with _OUTPUT_FILE_LOCK:
         output_data = {}
@@ -118,6 +126,8 @@ def update_preds_file(output_path: Path, instance_id: str, model_name: str, resu
             "model_name_or_path": model_name,
             "instance_id": instance_id,
             "model_patch": result,
+            "localization": localization.model_dump() if localization is not None else None,
+            "localization_parse_error": localization_parse_error,
         }
         output_path.write_text(json.dumps(output_data, indent=2))
 
@@ -155,6 +165,8 @@ def process_instance(
     exit_status = None
     result = None
     extra_info = {}
+    localization: Localization | None = None
+    localization_parse_error: str | None = None
 
     try:
         env = get_sb_environment(config, instance)
@@ -167,7 +179,17 @@ def process_instance(
         )
         info = agent.run(task)
         exit_status = info.get("exit_status")
-        result = info.get("submission")
+        raw_submission = info.get("submission") or ""
+        if exit_status == "Submitted":
+            try:
+                localization, result = split_submission(raw_submission)
+            except SubmissionParseError as e:
+                localization_parse_error = str(e)
+                result = raw_submission
+                exit_status = "LocalizationParseError"
+                logger.warning(f"Instance {instance_id}: {e}")
+        else:
+            result = raw_submission
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
         exit_status, result = type(e).__name__, ""
@@ -181,13 +203,22 @@ def process_instance(
                     "info": {
                         "exit_status": exit_status,
                         "submission": result,
+                        "localization": localization.model_dump() if localization is not None else None,
+                        "localization_parse_error": localization_parse_error,
                         **extra_info,
                     },
                     "instance_id": instance_id,
                 },
             )
             logger.info(f"Saved trajectory to '{traj_path}'")
-        update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
+        update_preds_file(
+            output_dir / "preds.json",
+            instance_id,
+            model.config.model_name,
+            result,
+            localization=localization,
+            localization_parse_error=localization_parse_error,
+        )
         progress_manager.on_instance_end(instance_id, exit_status)
 
 
