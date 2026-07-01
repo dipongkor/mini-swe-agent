@@ -3,6 +3,7 @@
 """Run mini-SWE-agent on SWE-bench instances in batch mode."""
 # Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
 
+import base64
 import concurrent.futures
 import json
 import random
@@ -91,6 +92,58 @@ def get_swebench_docker_image_name(instance: dict) -> str:
     return image_name
 
 
+class PrePatchMissingError(RuntimeError):
+    """Raised when no pre-patch file exists for an instance and a pre-patch dir was given."""
+
+
+class PrePatchApplyError(RuntimeError):
+    """Raised when applying or committing the pre-patch inside the environment fails."""
+
+
+def resolve_pre_patch_path(config: dict, instance_id: str) -> Path | None:
+    """Resolve the pre-patch file for an instance from `run.pre_patch_file` (explicit path,
+    applied to every instance of the run) or `run.pre_patch_dir` (per-instance
+    `<instance_id>.patch`/`.diff` lookup). Returns None if neither is configured.
+    """
+    run_config = config.get("run", {})
+    patch_file = run_config.get("pre_patch_file")
+    patch_dir = run_config.get("pre_patch_dir")
+    if patch_file and patch_dir:
+        raise ValueError("Set only one of run.pre_patch_file and run.pre_patch_dir")
+    if patch_file:
+        if not Path(patch_file).is_file():
+            raise PrePatchMissingError(f"Pre-patch file not found: {patch_file}")
+        return Path(patch_file)
+    if patch_dir:
+        candidates = [Path(patch_dir) / f"{instance_id}.patch", Path(patch_dir) / f"{instance_id}.diff"]
+        patch_path = next((path for path in candidates if path.is_file()), None)
+        if patch_path is None:
+            raise PrePatchMissingError(
+                f"No pre-patch for {instance_id}: expected one of {[str(p) for p in candidates]}"
+            )
+        return patch_path
+    return None
+
+
+def apply_pre_patch(env: Environment, instance_id: str, patch_path: Path) -> None:
+    """Apply the pre-patch to the base_commit checkout and commit it,
+    so that the agent's `git diff` only contains the agent's own changes.
+    """
+    # Transfer the patch base64-encoded so its content can't break shell quoting
+    encoded = base64.b64encode(patch_path.read_bytes()).decode()
+    commands = [
+        f"echo '{encoded}' | base64 -d > /tmp/mswea_pre_patch.diff",
+        "git apply --verbose /tmp/mswea_pre_patch.diff",
+        "git add -A",
+        "git -c user.name=mini-swe-agent -c user.email=mini@swe-agent.local commit -m 'Apply pre-experiment modification'",
+    ]
+    for command in commands:
+        out = env.execute({"command": command})
+        if out["returncode"] != 0:
+            raise PrePatchApplyError(f"Pre-patch for {instance_id} failed at {command!r}: {out}")
+    logger.info(f"Applied and committed pre-patch {patch_path} for {instance_id}")
+
+
 def get_sb_environment(config: dict, instance: dict) -> Environment:
     env_config = config.setdefault("environment", {})
     env_config["environment_class"] = env_config.get("environment_class", "docker")
@@ -103,9 +156,11 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
         startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)
-        out = env.execute(startup_command)
+        out = env.execute({"command": startup_command})
         if out["returncode"] != 0:
             raise RuntimeError(f"Error executing startup command: {out}")
+    if pre_patch_path := resolve_pre_patch_path(config, instance["instance_id"]):
+        apply_pre_patch(env, instance["instance_id"], pre_patch_path)
     return env
 
 
@@ -257,6 +312,8 @@ def main(
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
     environment_class: str | None = typer.Option(None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
+    pre_patch_dir: str = typer.Option("", "--pre-patch-dir", help="Directory with per-instance patches (<instance_id>.patch or .diff) that are applied and committed to the checkout before the agent starts", rich_help_panel="Advanced"),
+    pre_patch_file: str = typer.Option("", "--pre-patch-file", help="Single patch file that is applied and committed to the checkout before the agent starts (applied to every instance of this run; mutually exclusive with --pre-patch-dir)", rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -282,6 +339,7 @@ def main(
     configs.append({
         "environment": {"environment_class": environment_class or UNSET},
         "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
+        "run": {"pre_patch_dir": pre_patch_dir or UNSET, "pre_patch_file": pre_patch_file or UNSET},
     })
     config = recursive_merge(*configs)
 

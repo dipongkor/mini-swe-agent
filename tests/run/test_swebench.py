@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 from unittest.mock import patch
@@ -8,10 +9,14 @@ from pydantic import BaseModel
 from minisweagent import package_dir
 from minisweagent.models.test_models import DeterministicModel, make_output
 from minisweagent.run.benchmarks.swebench import (
+    PrePatchApplyError,
+    PrePatchMissingError,
+    apply_pre_patch,
     filter_instances,
     get_swebench_docker_image_name,
     main,
     remove_from_preds_file,
+    resolve_pre_patch_path,
     update_preds_file,
 )
 from minisweagent.run.benchmarks.utils.localization import Localization
@@ -572,3 +577,85 @@ def test_exception_handling_with_progress_manager(tmp_path, container_executable
 
             # on_uncaught_exception should not be called since exceptions are handled properly
             mock_progress_manager.on_uncaught_exception.assert_not_called()
+
+
+class _RecordingEnv:
+    """Fake environment that records executed commands. Commands containing `fail_on` return returncode 1."""
+
+    def __init__(self, fail_on: str = ""):
+        self.commands: list[str] = []
+        self.fail_on = fail_on
+
+    def execute(self, action: dict, cwd: str = "") -> dict:
+        command = action["command"]
+        self.commands.append(command)
+        returncode = 1 if self.fail_on and self.fail_on in command else 0
+        return {"output": "", "returncode": returncode, "exception_info": ""}
+
+
+def test_resolve_pre_patch_path_not_configured():
+    assert resolve_pre_patch_path({}, "some__instance-1") is None
+    assert resolve_pre_patch_path({"run": {}}, "some__instance-1") is None
+
+
+def test_resolve_pre_patch_path_from_dir(tmp_path):
+    (tmp_path / "some__instance-1.patch").write_text("diff")
+    (tmp_path / "some__instance-2.diff").write_text("diff")
+    config = {"run": {"pre_patch_dir": str(tmp_path)}}
+    assert resolve_pre_patch_path(config, "some__instance-1") == tmp_path / "some__instance-1.patch"
+    assert resolve_pre_patch_path(config, "some__instance-2") == tmp_path / "some__instance-2.diff"
+
+
+def test_resolve_pre_patch_path_from_dir_missing(tmp_path):
+    config = {"run": {"pre_patch_dir": str(tmp_path)}}
+    with pytest.raises(PrePatchMissingError, match="no__such-instance"):
+        resolve_pre_patch_path(config, "no__such-instance")
+
+
+def test_resolve_pre_patch_path_from_file_any_name(tmp_path):
+    patch_path = tmp_path / "my-experiment-42.custom.patch"
+    patch_path.write_text("diff")
+    config = {"run": {"pre_patch_file": str(patch_path)}}
+    assert resolve_pre_patch_path(config, "unrelated__instance-1") == patch_path
+
+
+def test_resolve_pre_patch_path_from_file_missing(tmp_path):
+    config = {"run": {"pre_patch_file": str(tmp_path / "nope.patch")}}
+    with pytest.raises(PrePatchMissingError, match="nope.patch"):
+        resolve_pre_patch_path(config, "some__instance-1")
+
+
+def test_resolve_pre_patch_path_both_configured_raises(tmp_path):
+    config = {"run": {"pre_patch_file": "a.patch", "pre_patch_dir": str(tmp_path)}}
+    with pytest.raises(ValueError, match="only one"):
+        resolve_pre_patch_path(config, "some__instance-1")
+
+
+def test_apply_pre_patch_applies_and_commits(tmp_path):
+    patch_content = "--- a/f.py\n+++ b/f.py\n@@\n-x = 'quotes' && $vars `backticks`\n+y\n"
+    patch_path = tmp_path / "some__instance-1.patch"
+    # write_bytes: the patch must reach the container byte-for-byte (no newline translation on Windows)
+    patch_path.write_bytes(patch_content.encode())
+    env = _RecordingEnv()
+
+    apply_pre_patch(env, "some__instance-1", patch_path)
+
+    assert len(env.commands) == 4
+    write_cmd, apply_cmd, add_cmd, commit_cmd = env.commands
+    # The patch is transferred base64-encoded and must decode back to the original content
+    encoded = re.search(r"echo '([^']+)' \| base64 -d", write_cmd).group(1)
+    assert base64.b64decode(encoded).decode() == patch_content
+    assert apply_cmd.startswith("git apply")
+    assert add_cmd == "git add -A"
+    assert commit_cmd.startswith("git ") and "commit" in commit_cmd
+
+
+def test_apply_pre_patch_failure_raises(tmp_path):
+    patch_path = tmp_path / "some__instance-1.patch"
+    patch_path.write_text("not a valid diff")
+    env = _RecordingEnv(fail_on="git apply")
+
+    with pytest.raises(PrePatchApplyError, match="git apply"):
+        apply_pre_patch(env, "some__instance-1", patch_path)
+    # Stops at the failing command: no add/commit afterwards
+    assert len(env.commands) == 2

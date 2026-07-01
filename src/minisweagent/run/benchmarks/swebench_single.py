@@ -53,6 +53,8 @@ def main(
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
     exit_immediately: bool = typer.Option(False, "--exit-immediately", help="Exit immediately when the agent wants to finish instead of prompting.", rich_help_panel="Advanced"),
     output: Path | None = typer.Option(DEFAULT_OUTPUT_FILE, "-o", "--output", help="Output trajectory file", rich_help_panel="Basic"),
+    pre_patch_dir: str = typer.Option("", "--pre-patch-dir", help="Directory with per-instance patches (<instance_id>.patch or .diff) that are applied and committed to the checkout before the agent starts", rich_help_panel="Advanced"),
+    pre_patch_file: str = typer.Option("", "--pre-patch-file", help="Single patch file that is applied and committed to the checkout before the agent starts (mutually exclusive with --pre-patch-dir)", rich_help_panel="Advanced"),
 ) -> None:
     # fmt: on
     """Run on a single SWE-Bench instance."""
@@ -83,6 +85,7 @@ def main(
         "environment": {
             "environment_class": environment_class or UNSET,
         },
+        "run": {"pre_patch_dir": pre_patch_dir or UNSET, "pre_patch_file": pre_patch_file or UNSET},
     })
     config = recursive_merge(*configs)
 
