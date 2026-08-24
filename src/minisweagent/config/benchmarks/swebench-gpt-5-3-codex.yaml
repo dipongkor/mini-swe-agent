@@ -15,7 +15,7 @@ agent:
     You're a software engineer interacting continuously with a computer by submitting commands.
     You'll be helping implement necessary changes to meet requirements in the PR description.
     Your task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.
-    <IMPORTANT>This is an interactive process where you will think and issue AT LEAST ONE command, see the result, then think and issue your next command(s).</important>
+    <IMPORTANT>This is an interactive process where you will think and issue AT LEAST ONE command, see the result, then think and issue your next command(s).</IMPORTANT>
 
     For each response:
 
@@ -31,11 +31,16 @@ agent:
 
     1. Analyze the codebase by finding and reading relevant files
     2. Create a script to reproduce the issue
-    3. Localize the root cause of the bug
+    3. Localize the root cause: identify the faulty statement(s) in the
+       original code and record their file, line number, and verbatim text
+       NOW, before you modify anything (see "Bug Localization" below for
+       what qualifies). You will submit this record as `localization.json`.
     4. Edit the source code to resolve the issue
     5. Verify your fix works by running your script again
     6. Test edge cases to ensure your fix is robust
-    7. Create a localization record (see "Bug Localization" below)
+    7. Revisit your localization record: if the fix taught you the fault
+       lies elsewhere than you first recorded, update it — but keep line
+       numbers and statements referring to the ORIGINAL (pre-fix) code.
 
     ## Command Execution Rules
 
@@ -60,9 +65,9 @@ agent:
 
     Example of a CORRECT response:
     <example_response>
-    I need to understand the Builder-related code. Let me find relevant files and check the project structure.
+    I need to understand the validation-related code. Let me find relevant files and check the project structure.
 
-    [Makes multiple bash tool calls: {"command": "ls -la"}, {"command": "find src -name '*.java' | grep -i builder"}, {"command": "cat README.md | head -50"}]
+    [Makes multiple bash tool calls: {"command": "ls -la"}, {"command": "grep -rn 'def validate' --include='*.py' . | head -20"}, {"command": "cat README.rst | head -50"}]
     </example_response>
 
     ## Environment Details
@@ -82,7 +87,8 @@ agent:
     localization record will be rejected.
 
     Write a file named `localization.json` in the working directory with
-    EXACTLY this JSON schema:
+    EXACTLY this structure (the values shown are illustrative placeholders,
+    except `confidence`, which must be one of the three listed options):
 
     ```json
     {
@@ -93,21 +99,82 @@ agent:
           "statement": "the exact source line responsible for the bug"
         }
       ],
-      "reasoning": "A concise explanation of why these lines are the root cause.",
-      "confidence": "high"
+      "reasoning": "How the cited original lines produce the reported failure (mechanism, not the fix).",
+      "confidence": "high|medium|low"
     }
     ```
 
-    Requirements:
+    Schema requirements:
 
     - `root_cause` is a non-empty list; each entry identifies ONE specific
       statement in a non-test source file, with its 1-indexed line number.
+    - `line` and `statement` MUST refer to the repository's ORIGINAL state,
+      BEFORE any of your modifications. Recover original content with
+      `git show HEAD:path/to/file.py | grep -n ...` or from the `-` side and
+      hunk headers of your `git diff`. Never reference a line you added.
+    - For a statement spanning multiple lines, use the line number of its
+      first line.
     - `file` paths must be relative to the repository root (match the paths
       used in `git diff`).
-    - `statement` must be the verbatim source line at that location.
-    - `reasoning` is a short free-text explanation (one or two sentences).
+    - `statement` must be the verbatim source line at that location in the
+      ORIGINAL file.
+    - `reasoning` is a short free-text explanation of the mechanism by which
+      the cited lines produce the reported failure. Describe the mechanism,
+      not your fix.
     - `confidence` must be exactly one of `"high"`, `"medium"`, or `"low"`.
     - The file must be valid JSON. Do not wrap it in markdown fences.
+
+    ### What counts as root cause
+
+    A statement belongs in `root_cause` only if it passes BOTH tests:
+
+    1. **Wrong-in-place**: in the ORIGINAL code, the statement itself does
+       the wrong thing given its role — it computes a wrong value from
+       correct inputs, makes an under- or over-inclusive decision, addresses
+       the wrong object, or fails to do something its position in the logic
+       requires.
+    2. **Must-change**: any reasonable patch that resolves the problem
+       described in the PR description has to change that statement or fill
+       a gap at exactly that point. If you can conceive of a plausible
+       alternative fix that leaves the statement untouched, it is not root
+       cause. When unsure whether one of your edits is load-bearing or just
+       plumbing, check empirically: temporarily revert only that edit and
+       rerun your reproduction script — if the issue stays fixed, the line
+       is not root cause.
+
+    Do NOT include lines that fail either test, even if your patch touches
+    them:
+
+    - **Downstream propagators**: statements that faithfully pass along,
+      format, emit, or act on a value that was already wrong when it reached
+      them. Trace the corruption upstream to where a correct input first
+      becomes a wrong value; that statement is the root cause, not the ones
+      after it.
+    - **Fix plumbing**: changes that only exist to deliver your fix — new
+      parameters and their threading through signatures and call chains,
+      variables introduced to carry a flag to the real decision point,
+      helpers you extracted, imports.
+    - **Refactor carriers**: lines your patch rewrites only because you
+      renamed, moved, or restructured something nearby — their behavior was
+      never wrong.
+    - **Faithful guards**: pre-existing checks or raises that correctly fire
+      on the bad state the bug produces. The guard that reports the problem
+      is not the problem.
+    - **Workaround removals**: old code your patch deletes because the real
+      fix makes it dead — its presence was not the cause.
+
+    **Missing-code bugs**: if the defect is that required code does not
+    exist (a missing check, missing parameter, missing override), there is
+    no wrong line to cite. Anchor the omission instead: reference the
+    closest existing ORIGINAL line where the missing logic belongs — the
+    statement immediately before the insertion point, the decision statement
+    that lacks a condition, or the enclosing `def`/`class` line — and state
+    in `reasoning` that this line anchors missing behavior rather than being
+    wrong itself.
+
+    `root_cause` is therefore usually a small subset of the lines your patch
+    touches — often a single statement — and, for missing-code bugs, can
+    include a line your patch does not modify at all.
 
     ## Submission
 
@@ -131,8 +198,11 @@ agent:
 
     Step 2: Write localization.json
     Create `localization.json` in the working directory following the schema
-    documented under "Bug Localization" above. The files referenced in
-    `root_cause` should correspond to the files modified by your patch.
+    and root-cause definition documented under "Bug Localization" above. The
+    files referenced in `root_cause` will normally be files your patch
+    modifies, but the anchored line itself may be one your patch does not
+    touch (see "Missing-code bugs"), and most lines your patch touches will
+    NOT qualify as root cause.
 
     Step 3: Verify your patch and localization
     Inspect `patch.txt` to confirm it only contains your intended changes and
@@ -160,7 +230,7 @@ agent:
 
 environment:
   cwd: "/testbed"
-  timeout: 60
+  timeout: 120
   pull_timeout: 1800
   interpreter: ["bash", "-c"]
   env:
@@ -217,11 +287,6 @@ model:
 
     If you have completed your assignment, please consult the first message about how to
     submit your solution (you will not be able to continue working on this task after that).
-  # gpt-5.3-codex only does tool-calling via OpenAI's Responses API. The default
-  # chat-completions backend just makes it emit "THOUGHT:" text and never call
-  # the tool (endless "No tool calls found" -> empty patch). Routing through
-  # mini-swe-agent's Responses-API backend (litellm.responses, which ships its
-  # own bash tool) makes it emit real tool calls. Verified working.
   model_class: litellm_response
   model_name: "openai/gpt-5.3-codex"
   model_kwargs:
